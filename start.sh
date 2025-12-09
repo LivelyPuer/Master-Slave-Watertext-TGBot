@@ -55,15 +55,32 @@ check_dependencies() {
         missing_deps+=("python3")
     fi
     
+    # Проверка python3-venv
+    if ! python3 -m venv --help > /dev/null 2>&1; then
+        print_warning "python3-venv не установлен"
+        missing_deps+=("python3-venv")
+    fi
+    
     if [ ${#missing_deps[@]} -ne 0 ]; then
         print_error "Отсутствуют необходимые зависимости: ${missing_deps[*]}"
         print_info "Установите их с помощью:"
-        print_info "  Ubuntu/Debian: sudo apt-get install ${missing_deps[*]}"
-        print_info "  macOS: brew install ${missing_deps[*]}"
+        echo ""
+        print_info "  Ubuntu/Debian:"
+        echo "    sudo apt-get update"
+        echo "    sudo apt-get install -y ${missing_deps[*]}"
+        echo ""
+        print_info "  CentOS/RHEL:"
+        echo "    sudo yum install -y ${missing_deps[*]}"
+        echo ""
+        print_info "  macOS:"
+        echo "    brew install ${missing_deps[*]}"
+        echo ""
         exit 1
     fi
     
-    print_success "Все зависимости установлены"
+    # Проверка версии Python
+    PYTHON_VERSION=$(python3 --version | cut -d' ' -f2 | cut -d'.' -f1,2)
+    print_success "Все зависимости установлены (Python $PYTHON_VERSION)"
 }
 
 # Клонирование или обновление репозитория
@@ -117,27 +134,70 @@ setup_repository() {
 setup_venv() {
     print_info "Настройка виртуального окружения..."
     
+    cd "$PROJECT_DIR" || exit 1
+    
     if [ ! -d "$VENV_DIR" ]; then
         print_info "Создание виртуального окружения..."
-        python3 -m venv "$VENV_DIR"
-        print_success "Виртуальное окружение создано"
+        if python3 -m venv "$VENV_DIR"; then
+            print_success "Виртуальное окружение создано"
+        else
+            print_error "Ошибка создания виртуального окружения"
+            exit 1
+        fi
+    else
+        print_success "Виртуальное окружение уже существует"
     fi
     
     # Активация виртуального окружения
     source "$VENV_DIR/bin/activate"
     
+    # Проверка активации
+    if [ -z "$VIRTUAL_ENV" ]; then
+        print_error "Не удалось активировать виртуальное окружение"
+        exit 1
+    fi
+    
+    print_success "Виртуальное окружение активировано: $VIRTUAL_ENV"
+    
     # Обновление pip
     print_info "Обновление pip..."
-    pip install --upgrade pip > /dev/null 2>&1
+    if pip install --upgrade pip --quiet; then
+        print_success "pip обновлен"
+    else
+        print_warning "Не удалось обновить pip, продолжаем..."
+    fi
     
-    # Установка зависимостей
+    # Установка/обновление зависимостей
     if [ -f "$PROJECT_DIR/requirements.txt" ]; then
-        print_info "Установка зависимостей..."
-        if pip install -r "$PROJECT_DIR/requirements.txt" > /dev/null 2>&1; then
-            print_success "Зависимости установлены"
+        print_info "Установка зависимостей из requirements.txt..."
+        
+        # Показываем прогресс
+        if pip install -r "$PROJECT_DIR/requirements.txt" --upgrade; then
+            print_success "Все зависимости успешно установлены"
         else
-            print_warning "Некоторые зависимости могут быть не установлены"
+            print_error "Ошибка установки зависимостей"
+            print_info "Попытка установки с флагом совместимости..."
+            
+            # Попытка с переменной окружения для Python 3.14
+            export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+            if pip install -r "$PROJECT_DIR/requirements.txt" --upgrade; then
+                print_success "Зависимости установлены с режимом совместимости"
+            else
+                print_error "Критическая ошибка установки зависимостей"
+                print_info "Попробуйте установить вручную:"
+                print_info "  cd $PROJECT_DIR"
+                print_info "  source .venv/bin/activate"
+                print_info "  export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1"
+                print_info "  pip install -r requirements.txt"
+                exit 1
+            fi
         fi
+        
+        # Показываем установленные пакеты
+        print_info "Установленные пакеты:"
+        pip list | grep -E "aiogram|Pillow|python-dotenv"
+    else
+        print_warning "Файл requirements.txt не найден"
     fi
 }
 
@@ -262,8 +322,25 @@ show_status() {
             print_info "Проект: $PROJECT_DIR"
             print_info "Логи: $LOG_FILE"
             
+            # Проверка виртуального окружения
+            if [ -d "$VENV_DIR" ]; then
+                print_info "Виртуальное окружение: активно"
+                
+                # Показываем версии пакетов
+                source "$VENV_DIR/bin/activate"
+                AIOGRAM_VER=$(pip show aiogram 2>/dev/null | grep Version | cut -d' ' -f2)
+                PILLOW_VER=$(pip show Pillow 2>/dev/null | grep Version | cut -d' ' -f2)
+                
+                if [ -n "$AIOGRAM_VER" ]; then
+                    print_info "  - aiogram: $AIOGRAM_VER"
+                fi
+                if [ -n "$PILLOW_VER" ]; then
+                    print_info "  - Pillow: $PILLOW_VER"
+                fi
+            fi
+            
             if [ -f "$PROJECT_DIR/slaves_database.json" ]; then
-                SLAVES_COUNT=$(python3 -c "import json; print(len(json.load(open('$PROJECT_DIR/slaves_database.json'))))" 2>/dev/null)
+                SLAVES_COUNT=$(python3 -c "import json; print(len(json.load(open('$PROJECT_DIR/slaves_database.json'))))" 2>/dev/null || echo "0")
                 print_info "Slave ботов в базе: $SLAVES_COUNT"
             fi
         else
@@ -272,6 +349,25 @@ show_status() {
         fi
     else
         print_warning "Бот не запущен"
+        
+        # Проверяем наличие проекта и зависимостей
+        if [ -d "$PROJECT_DIR" ]; then
+            print_info "Проект найден: $PROJECT_DIR"
+            
+            if [ -d "$VENV_DIR" ]; then
+                print_info "Виртуальное окружение: установлено"
+            else
+                print_warning "Виртуальное окружение: не установлено"
+            fi
+            
+            if [ -f "$PROJECT_DIR/.env" ]; then
+                print_info "Конфигурация: .env файл найден"
+            else
+                print_warning "Конфигурация: .env файл НЕ найден"
+            fi
+        else
+            print_info "Проект не установлен"
+        fi
     fi
     
     echo ""
@@ -310,6 +406,7 @@ main() {
             check_env
             check_font
             start_bot
+            show_status
             ;;
         restart)
             check_dependencies
@@ -319,6 +416,7 @@ main() {
             check_env
             check_font
             restart_bot
+            show_status
             ;;
         status)
             show_status
@@ -334,6 +432,35 @@ main() {
             check_env
             check_font
             start_bot
+            show_status
+            ;;
+        install)
+            print_info "Полная установка проекта..."
+            check_dependencies
+            setup_repository
+            setup_venv
+            check_font
+            print_success "Установка завершена!"
+            print_warning "Не забудьте создать .env файл в $PROJECT_DIR"
+            print_info "Затем запустите: $0 start"
+            ;;
+        reinstall)
+            print_warning "Полная переустановка проекта..."
+            read -p "Вы уверены? Это удалит все данные! (yes/no): " confirm
+            if [ "$confirm" = "yes" ]; then
+                stop_bot
+                print_info "Удаление старой установки..."
+                rm -rf "$PROJECT_DIR"
+                print_info "Установка заново..."
+                check_dependencies
+                setup_repository
+                setup_venv
+                check_font
+                print_success "Переустановка завершена!"
+                print_warning "Не забудьте создать .env файл в $PROJECT_DIR"
+            else
+                print_info "Переустановка отменена"
+            fi
             ;;
         *)
             # Режим по умолчанию: обновление и запуск
@@ -346,6 +473,7 @@ main() {
             
             # Если бот уже запущен и были обновления, перезапускаем
             if [ -f "$PID_FILE" ] && [ $UPDATED -eq 1 ]; then
+                print_info "Обнаружены обновления, перезапускаем бота..."
                 restart_bot
             elif [ -f "$PID_FILE" ]; then
                 print_info "Бот уже запущен, обновлений нет"
