@@ -67,7 +67,7 @@ python main.py
 ```
 ### 4.1 Автозапуск
 ```bash
-sudo chmod +x /usr/local/bin/start.sh
+sudo chmod +x ./start.sh
 ./start.sh
 ```
 Важно:
