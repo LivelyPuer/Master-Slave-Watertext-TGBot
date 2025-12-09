@@ -265,7 +265,7 @@ async def process_image_with_watermark(image_bytes: bytes, watermark_text: str) 
         
         # Определяем размер шрифта: 30% от минимальной стороны
         min_side = min(img.width, img.height)
-        target_text_size = int(min_side * 0.3)
+        target_text_size = int(min_side * 0.5)
         logger.info(f"Минимальная сторона: {min_side}px, целевой размер текста: {target_text_size}px")
         
         # Загружаем шрифт Roboto.ttf
