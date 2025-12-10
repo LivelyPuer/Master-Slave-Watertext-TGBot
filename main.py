@@ -265,7 +265,7 @@ async def process_image_with_watermark(image_bytes: bytes, watermark_text: str) 
         
         # Определяем размер шрифта: 30% от минимальной стороны
         min_side = min(img.width, img.height)
-        target_text_size = int(min_side * 0.5)
+        target_text_size = int(min_side * 0.3)
         logger.info(f"Минимальная сторона: {min_side}px, целевой размер текста: {target_text_size}px")
         
         # Загружаем шрифт Roboto.ttf
@@ -371,7 +371,7 @@ def create_slave_router(watermark_text: str) -> Router:
             await message.answer("❌ Пожалуйста, отправьте файл изображения (JPEG, PNG и т.д.)")
             return
         
-        await message.answer("⏳ Обрабатываю изображение...")
+        processing_message = await message.answer("⏳ Обрабатываю изображение...")
         
         try:
             # Получаем файл
@@ -395,6 +395,11 @@ def create_slave_router(watermark_text: str) -> Router:
                 filename=f"watermarked_{doc.file_name}"
             )
             
+            # Удаляем сообщение "Обрабатываю изображение..."
+            if processing_message:
+                await message.bot.delete_message(chat_id=message.chat.id, message_id=processing_message.message_id)
+                logger.info("Сообщение 'Обрабатываю изображение...' удалено")
+
             await message.answer_document(
                 document=input_file)
             logger.info("Изображение отправлено пользователю")
