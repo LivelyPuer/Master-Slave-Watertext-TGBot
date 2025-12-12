@@ -32,8 +32,18 @@ SLAVES_DB_FILE = "slaves_database.json"
 # Хранилище активных slave ботов
 active_slaves: Dict[str, Bot] = {}
 slave_watermarks: Dict[str, str] = {}
+slave_watermark_settings: Dict[str, Dict] = {}  # Настройки водяного знака для каждого slave
 slave_dispatchers: Dict[str, Dispatcher] = {}
 slave_tasks: List[asyncio.Task] = []  # Задачи polling для slave ботов
+
+# Структура настроек водяного знака по умолчанию
+DEFAULT_WATERMARK_SETTINGS = {
+    "size_percent": 0.3,  # 30% от минимальной стороны
+    "color_r": 255,  # Белый цвет
+    "color_g": 255,
+    "color_b": 255,
+    "opacity": 128  # 50% прозрачности (0-255)
+}
 
 
 # ============= БАЗА ДАННЫХ SLAVE БОТОВ =============
@@ -58,10 +68,12 @@ def save_slaves_to_db():
     slaves_data = []
     
     for token, bot in active_slaves.items():
-        slaves_data.append({
+        slave_data = {
             "token": token,
-            "watermark": slave_watermarks.get(token, "")
-        })
+            "watermark": slave_watermarks.get(token, ""),
+            "settings": slave_watermark_settings.get(token, DEFAULT_WATERMARK_SETTINGS.copy())
+        }
+        slaves_data.append(slave_data)
     
     try:
         with open(SLAVES_DB_FILE, 'w', encoding='utf-8') as f:
@@ -84,6 +96,7 @@ async def restore_slaves_from_db():
     for slave_info in slaves_data:
         token = slave_info.get("token")
         watermark = slave_info.get("watermark", "")
+        settings = slave_info.get("settings", DEFAULT_WATERMARK_SETTINGS.copy())
         
         if not token:
             logger.warning("Пропущена запись без токена")
@@ -91,6 +104,8 @@ async def restore_slaves_from_db():
         
         try:
             logger.info(f"Восстановление slave бота с водяным знаком: {watermark}")
+            # Сохраняем настройки перед запуском
+            slave_watermark_settings[token] = settings
             task = await start_slave_bot(token, watermark, save_to_db=False)
             slave_tasks.append(task)
             logger.info(f"✅ Slave бот восстановлен успешно")
@@ -103,6 +118,12 @@ class MasterStates(StatesGroup):
     waiting_password = State()
     waiting_slave_token = State()
     waiting_watermark = State()
+    waiting_slave_selection = State()  # Выбор slave бота для настройки
+    waiting_watermark_text = State()  # Изменение текста водяного знака
+    waiting_size_percent = State()  # Настройка размера
+    waiting_color = State()  # Настройка цвета (RGB)
+    waiting_opacity = State()  # Настройка прозрачности
+    waiting_test_image = State()  # Ожидание тестового изображения
 
 
 class SlaveStates(StatesGroup):
@@ -112,6 +133,7 @@ class SlaveStates(StatesGroup):
 # ============= MASTER BOT =============
 master_router = Router()
 authenticated_users = set()
+selected_slave_tokens: Dict[int, str] = {}  # Хранилище выбранных slave ботов для каждого пользователя
 
 
 @master_router.message(CommandStart())
@@ -123,6 +145,8 @@ async def master_start(message: Message, state: FSMContext):
             "Доступные команды:\n"
             "/create_slave - Создать нового slave бота\n"
             "/list_slaves - Список активных slave ботов\n"
+            "/configure_slave - Настроить водяной знак slave бота\n"
+            "/test_watermark - Отправить тестовое изображение\n"
             "/stop_slave - Остановить slave бота"
         )
     else:
@@ -142,6 +166,8 @@ async def check_password(message: Message, state: FSMContext):
             "Доступные команды:\n"
             "/create_slave - Создать нового slave бота\n"
             "/list_slaves - Список активных slave ботов\n"
+            "/configure_slave - Настроить водяной знак slave бота\n"
+            "/test_watermark - Отправить тестовое изображение\n"
             "/stop_slave - Остановить slave бота"
         )
     else:
@@ -191,6 +217,9 @@ async def receive_watermark(message: Message, state: FSMContext):
     
     logger.info(f"Создание slave бота @{bot_username} с водяным знаком: {watermark_text}")
     
+    # Инициализируем настройки по умолчанию
+    slave_watermark_settings[token] = DEFAULT_WATERMARK_SETTINGS.copy()
+    
     task = await start_slave_bot(token, watermark_text, save_to_db=True)
     slave_tasks.append(task)
     
@@ -199,7 +228,8 @@ async def receive_watermark(message: Message, state: FSMContext):
         f"🤖 Бот: @{bot_username}\n"
         f"💧 Водяной знак: {watermark_text}\n\n"
         f"Теперь вы можете отправлять изображения этому боту.\n"
-        f"💾 Данные сохранены в базу данных."
+        f"💾 Данные сохранены в базу данных.\n\n"
+        f"Используйте /configure_slave для настройки водяного знака."
     )
     await state.clear()
 
@@ -238,11 +268,381 @@ async def stop_slave(message: Message):
     )
 
 
+@master_router.message(Command("configure_slave"))
+async def configure_slave_start(message: Message, state: FSMContext):
+    logger.info(f"Команда /configure_slave от пользователя {message.from_user.id}")
+    if message.from_user.id not in authenticated_users:
+        await message.answer("❌ Доступ запрещен. Используйте /start для авторизации.")
+        return
+    
+    if not active_slaves:
+        await message.answer("❌ Нет активных slave ботов. Создайте бота командой /create_slave")
+        return
+    
+    # Формируем список slave ботов
+    response = "📋 Выберите slave бота для настройки:\n\n"
+    bot_list = []
+    for i, (token, bot) in enumerate(active_slaves.items(), 1):
+        bot_info = await bot.get_me()
+        watermark = slave_watermarks.get(token, "N/A")
+        bot_list.append((token, bot_info.username))
+        response += f"{i}. @{bot_info.username}\n   💧 Водяной знак: {watermark}\n\n"
+    
+    await state.update_data(bot_list=bot_list)
+    await message.answer(response + "Введите номер бота (1, 2, 3...):")
+    await state.set_state(MasterStates.waiting_slave_selection)
+
+
+@master_router.message(MasterStates.waiting_slave_selection)
+async def receive_slave_selection(message: Message, state: FSMContext):
+    try:
+        bot_number = int(message.text.strip())
+        data = await state.get_data()
+        bot_list = data.get('bot_list', [])
+        
+        if bot_number < 1 or bot_number > len(bot_list):
+            await message.answer(f"❌ Неверный номер. Введите число от 1 до {len(bot_list)}:")
+            return
+        
+        token, username = bot_list[bot_number - 1]
+        settings = slave_watermark_settings.get(token, DEFAULT_WATERMARK_SETTINGS.copy())
+        watermark = slave_watermarks.get(token, "")
+        
+        # Сохраняем выбранный бот для пользователя
+        selected_slave_tokens[message.from_user.id] = token
+        
+        response = (
+            f"⚙️ Настройка водяного знака для @{username}\n\n"
+            f"📝 Текущий текст: {watermark}\n"
+            f"📏 Размер: {settings['size_percent']*100:.0f}% от минимальной стороны\n"
+            f"🎨 Цвет: RGB({settings['color_r']}, {settings['color_g']}, {settings['color_b']})\n"
+            f"👻 Прозрачность: {int(settings['opacity']/255*100)}%\n\n"
+            f"Выберите параметр для изменения:\n"
+            f"1️⃣ /set_text - Изменить текст\n"
+            f"2️⃣ /set_size - Изменить размер (0.1-1.0)\n"
+            f"3️⃣ /set_color - Изменить цвет (R G B, например: 255 255 255)\n"
+            f"4️⃣ /set_opacity - Изменить прозрачность (0-100%)\n"
+            f"5️⃣ /test_watermark - Отправить тестовое изображение"
+        )
+        await message.answer(response)
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Введите число (1, 2, 3...):")
+
+
+@master_router.message(Command("set_text"))
+async def set_text_start(message: Message, state: FSMContext):
+    if message.from_user.id not in authenticated_users:
+        await message.answer("❌ Доступ запрещен.")
+        return
+    
+    if not active_slaves:
+        await message.answer("❌ Нет активных slave ботов.")
+        return
+    
+    # Получаем выбранный бот
+    token = selected_slave_tokens.get(message.from_user.id)
+    if not token and len(active_slaves) == 1:
+        token = list(active_slaves.keys())[0]
+        selected_slave_tokens[message.from_user.id] = token
+    
+    if not token:
+        await message.answer("❌ Сначала выберите бота командой /configure_slave")
+        return
+    
+    await message.answer("📝 Введите новый текст водяного знака:")
+    await state.set_state(MasterStates.waiting_watermark_text)
+
+
+@master_router.message(MasterStates.waiting_watermark_text)
+async def receive_watermark_text(message: Message, state: FSMContext):
+    new_text = message.text
+    token = selected_slave_tokens.get(message.from_user.id)
+    
+    if not token or token not in active_slaves:
+        await message.answer("❌ Ошибка: бот не найден. Начните заново с /configure_slave")
+        await state.clear()
+        return
+    
+    slave_watermarks[token] = new_text
+    save_slaves_to_db()
+    
+    # Перезапускаем slave бота с новым текстом
+    bot = active_slaves[token]
+    bot_info = await bot.get_me()
+    
+    # Останавливаем старый dispatcher и создаем новый
+    old_dp = slave_dispatchers.get(token)
+    if old_dp:
+        await old_dp.stop_polling()
+    
+    # Создаем новый router с обновленным текстом
+    storage = MemoryStorage()
+    new_dp = Dispatcher(storage=storage)
+    router = create_slave_router(new_text, token)
+    new_dp.include_router(router)
+    slave_dispatchers[token] = new_dp
+    
+    # Перезапускаем polling
+    task = asyncio.create_task(new_dp.start_polling(bot, handle_signals=False))
+    # Находим и заменяем старую задачу
+    for i, t in enumerate(slave_tasks):
+        if not t.done():
+            t.cancel()
+            slave_tasks[i] = task
+            break
+    else:
+        slave_tasks.append(task)
+    
+    await message.answer(f"✅ Текст водяного знака обновлен: {new_text}")
+    await state.clear()
+
+
+@master_router.message(Command("set_size"))
+async def set_size_start(message: Message, state: FSMContext):
+    if message.from_user.id not in authenticated_users:
+        await message.answer("❌ Доступ запрещен.")
+        return
+    
+    if not active_slaves:
+        await message.answer("❌ Нет активных slave ботов.")
+        return
+    
+    # Получаем выбранный бот
+    token = selected_slave_tokens.get(message.from_user.id)
+    if not token and len(active_slaves) == 1:
+        token = list(active_slaves.keys())[0]
+        selected_slave_tokens[message.from_user.id] = token
+    
+    if not token:
+        await message.answer("❌ Сначала выберите бота командой /configure_slave")
+        return
+    
+    await message.answer("📏 Введите размер водяного знака (0.1-1.0, например 0.3 для 30%):")
+    await state.set_state(MasterStates.waiting_size_percent)
+
+
+@master_router.message(MasterStates.waiting_size_percent)
+async def receive_size_percent(message: Message, state: FSMContext):
+    try:
+        size = float(message.text.strip())
+        if size < 0.1 or size > 1.0:
+            await message.answer("❌ Размер должен быть от 0.1 до 1.0. Попробуйте еще раз:")
+            return
+        
+        token = selected_slave_tokens.get(message.from_user.id)
+        
+        if not token or token not in active_slaves:
+            await message.answer("❌ Ошибка: бот не найден. Начните заново с /configure_slave")
+            await state.clear()
+            return
+        
+        if token not in slave_watermark_settings:
+            slave_watermark_settings[token] = DEFAULT_WATERMARK_SETTINGS.copy()
+        
+        slave_watermark_settings[token]['size_percent'] = size
+        save_slaves_to_db()
+        
+        await message.answer(f"✅ Размер водяного знака обновлен: {size*100:.0f}%")
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Введите число (например: 0.3):")
+
+
+@master_router.message(Command("set_color"))
+async def set_color_start(message: Message, state: FSMContext):
+    if message.from_user.id not in authenticated_users:
+        await message.answer("❌ Доступ запрещен.")
+        return
+    
+    if not active_slaves:
+        await message.answer("❌ Нет активных slave ботов.")
+        return
+    
+    # Получаем выбранный бот
+    token = selected_slave_tokens.get(message.from_user.id)
+    if not token and len(active_slaves) == 1:
+        token = list(active_slaves.keys())[0]
+        selected_slave_tokens[message.from_user.id] = token
+    
+    if not token:
+        await message.answer("❌ Сначала выберите бота командой /configure_slave")
+        return
+    
+    await message.answer("🎨 Введите цвет в формате RGB (три числа от 0 до 255 через пробел):\nНапример: 255 255 255 (белый)")
+    await state.set_state(MasterStates.waiting_color)
+
+
+@master_router.message(MasterStates.waiting_color)
+async def receive_color(message: Message, state: FSMContext):
+    try:
+        parts = message.text.strip().split()
+        if len(parts) != 3:
+            await message.answer("❌ Введите три числа через пробел (например: 255 255 255):")
+            return
+        
+        r, g, b = int(parts[0]), int(parts[1]), int(parts[2])
+        
+        if not all(0 <= val <= 255 for val in [r, g, b]):
+            await message.answer("❌ Значения должны быть от 0 до 255. Попробуйте еще раз:")
+            return
+        
+        token = selected_slave_tokens.get(message.from_user.id)
+        
+        if not token or token not in active_slaves:
+            await message.answer("❌ Ошибка: бот не найден. Начните заново с /configure_slave")
+            await state.clear()
+            return
+        
+        if token not in slave_watermark_settings:
+            slave_watermark_settings[token] = DEFAULT_WATERMARK_SETTINGS.copy()
+        
+        slave_watermark_settings[token]['color_r'] = r
+        slave_watermark_settings[token]['color_g'] = g
+        slave_watermark_settings[token]['color_b'] = b
+        save_slaves_to_db()
+        
+        await message.answer(f"✅ Цвет обновлен: RGB({r}, {g}, {b})")
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Введите три числа от 0 до 255 через пробел:")
+
+
+@master_router.message(Command("set_opacity"))
+async def set_opacity_start(message: Message, state: FSMContext):
+    if message.from_user.id not in authenticated_users:
+        await message.answer("❌ Доступ запрещен.")
+        return
+    
+    if not active_slaves:
+        await message.answer("❌ Нет активных slave ботов.")
+        return
+    
+    # Получаем выбранный бот
+    token = selected_slave_tokens.get(message.from_user.id)
+    if not token and len(active_slaves) == 1:
+        token = list(active_slaves.keys())[0]
+        selected_slave_tokens[message.from_user.id] = token
+    
+    if not token:
+        await message.answer("❌ Сначала выберите бота командой /configure_slave")
+        return
+    
+    await message.answer("👻 Введите прозрачность (0-100%, где 0 - полностью прозрачный, 100 - непрозрачный):")
+    await state.set_state(MasterStates.waiting_opacity)
+
+
+@master_router.message(MasterStates.waiting_opacity)
+async def receive_opacity(message: Message, state: FSMContext):
+    try:
+        opacity_percent = int(message.text.strip())
+        if opacity_percent < 0 or opacity_percent > 100:
+            await message.answer("❌ Прозрачность должна быть от 0 до 100. Попробуйте еще раз:")
+            return
+        
+        opacity = int(opacity_percent / 100 * 255)
+        
+        token = selected_slave_tokens.get(message.from_user.id)
+        
+        if not token or token not in active_slaves:
+            await message.answer("❌ Ошибка: бот не найден. Начните заново с /configure_slave")
+            await state.clear()
+            return
+        
+        if token not in slave_watermark_settings:
+            slave_watermark_settings[token] = DEFAULT_WATERMARK_SETTINGS.copy()
+        
+        slave_watermark_settings[token]['opacity'] = opacity
+        save_slaves_to_db()
+        
+        await message.answer(f"✅ Прозрачность обновлена: {opacity_percent}%")
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Введите число от 0 до 100:")
+
+
+@master_router.message(Command("test_watermark"))
+async def test_watermark_start(message: Message, state: FSMContext):
+    if message.from_user.id not in authenticated_users:
+        await message.answer("❌ Доступ запрещен.")
+        return
+    
+    if not active_slaves:
+        await message.answer("❌ Нет активных slave ботов.")
+        return
+    
+    # Получаем выбранный бот
+    token = selected_slave_tokens.get(message.from_user.id)
+    if not token and len(active_slaves) == 1:
+        token = list(active_slaves.keys())[0]
+        selected_slave_tokens[message.from_user.id] = token
+    
+    if not token:
+        await message.answer("❌ Сначала выберите бота командой /configure_slave")
+        return
+    
+    await message.answer("📤 Отправьте тестовое изображение (как файл):")
+    await state.set_state(MasterStates.waiting_test_image)
+
+
+@master_router.message(MasterStates.waiting_test_image, F.document)
+async def process_test_image(message: Message, state: FSMContext):
+    doc = message.document
+    
+    if not doc.mime_type or not doc.mime_type.startswith('image/'):
+        await message.answer("❌ Пожалуйста, отправьте файл изображения (JPEG, PNG и т.д.)")
+        return
+    
+    token = selected_slave_tokens.get(message.from_user.id)
+    
+    if not token or token not in active_slaves:
+        await message.answer("❌ Ошибка: бот не найден. Начните заново с /configure_slave")
+        await state.clear()
+        return
+    
+    watermark_text = slave_watermarks.get(token, "")
+    settings = slave_watermark_settings.get(token, DEFAULT_WATERMARK_SETTINGS.copy())
+    
+    try:
+        # Получаем файл
+        file = await message.bot.get_file(doc.file_id)
+        file_bytes = await message.bot.download_file(file.file_path)
+        
+        # Обрабатываем изображение с настройками
+        processed_image = await process_image_with_watermark(
+            file_bytes.read(),
+            watermark_text,
+            settings
+        )
+        
+        # Отправляем обработанное изображение
+        input_file = BufferedInputFile(
+            processed_image,
+            filename=f"test_watermarked_{doc.file_name}"
+        )
+        
+        await message.answer_document(document=input_file)
+        await message.answer("✅ Тестовое изображение обработано с текущими настройками водяного знака.")
+        await state.clear()
+    except Exception as e:
+        logger.error(f"Ошибка обработки тестового изображения: {e}", exc_info=True)
+        await message.answer(f"❌ Ошибка обработки: {str(e)}")
+        await state.clear()
+
+
 # ============= SLAVE BOT ЛОГИКА =============
-async def process_image_with_watermark(image_bytes: bytes, watermark_text: str) -> bytes:
+async def process_image_with_watermark(
+    image_bytes: bytes, 
+    watermark_text: str, 
+    settings: Optional[Dict] = None
+) -> bytes:
     """Обрабатывает изображение: увеличивает разрешение x2 и добавляет водяной знак"""
+    if settings is None:
+        settings = DEFAULT_WATERMARK_SETTINGS.copy()
+    
     logger.info(f"Начало обработки изображения. Размер: {len(image_bytes)} байт")
     logger.info(f"Водяной знак: {watermark_text}")
+    logger.info(f"Настройки: {settings}")
     
     try:
         img = Image.open(BytesIO(image_bytes))
@@ -263,10 +663,11 @@ async def process_image_with_watermark(image_bytes: bytes, watermark_text: str) 
         watermark_layer = Image.new('RGBA', img.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(watermark_layer)
         
-        # Определяем размер шрифта: 30% от минимальной стороны
+        # Определяем размер шрифта из настроек
         min_side = min(img.width, img.height)
-        target_text_size = int(min_side * 0.3)
-        logger.info(f"Минимальная сторона: {min_side}px, целевой размер текста: {target_text_size}px")
+        size_percent = settings.get('size_percent', DEFAULT_WATERMARK_SETTINGS['size_percent'])
+        target_text_size = int(min_side * size_percent)
+        logger.info(f"Минимальная сторона: {min_side}px, целевой размер текста: {target_text_size}px ({size_percent*100:.0f}%)")
         
         # Загружаем шрифт Roboto.ttf
         font = None
@@ -320,8 +721,15 @@ async def process_image_with_watermark(image_bytes: bytes, watermark_text: str) 
         y = img.height - text_height - margin_y
         logger.info(f"Позиция водяного знака: ({x}, {y}), отступы: ({margin_x}, {margin_y})")
         
-        # Рисуем полупрозрачный текст (белый с 50% прозрачностью)
-        draw.text((x, y), watermark_text, fill=(255, 255, 255, 128), font=font)
+        # Получаем цвет и прозрачность из настроек
+        color_r = settings.get('color_r', DEFAULT_WATERMARK_SETTINGS['color_r'])
+        color_g = settings.get('color_g', DEFAULT_WATERMARK_SETTINGS['color_g'])
+        color_b = settings.get('color_b', DEFAULT_WATERMARK_SETTINGS['color_b'])
+        opacity = settings.get('opacity', DEFAULT_WATERMARK_SETTINGS['opacity'])
+        
+        # Рисуем текст с настройками цвета и прозрачности
+        draw.text((x, y), watermark_text, fill=(color_r, color_g, color_b, opacity), font=font)
+        logger.info(f"Цвет: RGB({color_r}, {color_g}, {color_b}), прозрачность: {opacity}/255")
         
         # Накладываем водяной знак
         img = Image.alpha_composite(img, watermark_layer)
@@ -344,7 +752,7 @@ async def process_image_with_watermark(image_bytes: bytes, watermark_text: str) 
         raise
 
 
-def create_slave_router(watermark_text: str) -> Router:
+def create_slave_router(watermark_text: str, token: Optional[str] = None) -> Router:
     """Создает router для slave бота с заданным водяным знаком"""
     router = Router()
     
@@ -384,9 +792,12 @@ def create_slave_router(watermark_text: str) -> Router:
             
             # Обрабатываем изображение
             logger.info("Начало обработки изображения...")
+            # Получаем настройки для этого slave бота
+            settings = slave_watermark_settings.get(token, DEFAULT_WATERMARK_SETTINGS.copy()) if token else DEFAULT_WATERMARK_SETTINGS.copy()
             processed_image = await process_image_with_watermark(
                 file_bytes.read(), 
-                watermark_text
+                watermark_text,
+                settings
             )            
             # Отправляем обработанное изображение используя BufferedInputFile
             logger.info("Отправка обработанного изображения...")
@@ -429,7 +840,7 @@ async def start_slave_bot(token: str, watermark_text: str, save_to_db: bool = Tr
     dp = Dispatcher(storage=storage)
     
     # Создаем и регистрируем router для этого slave бота
-    router = create_slave_router(watermark_text)
+    router = create_slave_router(watermark_text, token)
     dp.include_router(router)
     
     # Сохраняем в глобальном хранилище
