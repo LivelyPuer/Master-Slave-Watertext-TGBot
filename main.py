@@ -42,7 +42,10 @@ DEFAULT_WATERMARK_SETTINGS = {
     "color_r": 255,  # Белый цвет
     "color_g": 255,
     "color_b": 255,
-    "opacity": 128  # 50% прозрачности (0-255)
+    "opacity": 128,  # 50% прозрачности (0-255)
+    "auto_color": False,  # Автоматическое определение цвета
+    "stroke_enabled": False,  # Включена ли обводка
+    "stroke_width": 2  # Толщина обводки в пикселях
 }
 
 
@@ -123,6 +126,7 @@ class MasterStates(StatesGroup):
     waiting_size_percent = State()  # Настройка размера
     waiting_color = State()  # Настройка цвета (RGB)
     waiting_opacity = State()  # Настройка прозрачности
+    waiting_stroke_width = State()  # Настройка толщины обводки
     waiting_test_image = State()  # Ожидание тестового изображения
 
 
@@ -311,18 +315,29 @@ async def receive_slave_selection(message: Message, state: FSMContext):
         # Сохраняем выбранный бот для пользователя
         selected_slave_tokens[message.from_user.id] = token
         
+        auto_color_status = "✅ Включено" if settings.get('auto_color', False) else "❌ Выключено"
+        color_info = "Автоматический (белый/черный)" if settings.get('auto_color', False) else f"RGB({settings['color_r']}, {settings['color_g']}, {settings['color_b']})"
+        stroke_enabled = settings.get('stroke_enabled', False)
+        stroke_width = settings.get('stroke_width', 2)
+        stroke_status = f"✅ Включена (толщина: {stroke_width}px)" if stroke_enabled else "❌ Выключена"
+        
         response = (
             f"⚙️ Настройка водяного знака для @{username}\n\n"
             f"📝 Текущий текст: {watermark}\n"
             f"📏 Размер: {settings['size_percent']*100:.0f}% от минимальной стороны\n"
-            f"🎨 Цвет: RGB({settings['color_r']}, {settings['color_g']}, {settings['color_b']})\n"
-            f"👻 Прозрачность: {int(settings['opacity']/255*100)}%\n\n"
+            f"🎨 Цвет: {color_info}\n"
+            f"🤖 Автоматический цвет: {auto_color_status}\n"
+            f"👻 Прозрачность: {int(settings['opacity']/255*100)}%\n"
+            f"🖊️ Обводка: {stroke_status}\n\n"
             f"Выберите параметр для изменения:\n"
             f"1️⃣ /set_text - Изменить текст\n"
             f"2️⃣ /set_size - Изменить размер (0.1-1.0)\n"
             f"3️⃣ /set_color - Изменить цвет (R G B, например: 255 255 255)\n"
             f"4️⃣ /set_opacity - Изменить прозрачность (0-100%)\n"
-            f"5️⃣ /test_watermark - Отправить тестовое изображение"
+            f"5️⃣ /set_auto_color - Включить/выключить автоматический цвет\n"
+            f"6️⃣ /set_stroke - Включить/выключить обводку\n"
+            f"7️⃣ /set_stroke_width - Изменить толщину обводки\n"
+            f"8️⃣ /test_watermark - Отправить тестовое изображение"
         )
         await message.answer(response)
         await state.clear()
@@ -396,6 +411,9 @@ async def receive_watermark_text(message: Message, state: FSMContext):
     
     await message.answer(f"✅ Текст водяного знака обновлен: {new_text}")
     await state.clear()
+    
+    # Отправляем тестовое изображение
+    await send_test_preview(message, token)
 
 
 @master_router.message(Command("set_size"))
@@ -445,6 +463,9 @@ async def receive_size_percent(message: Message, state: FSMContext):
         
         await message.answer(f"✅ Размер водяного знака обновлен: {size*100:.0f}%")
         await state.clear()
+        
+        # Отправляем тестовое изображение
+        await send_test_preview(message, token)
     except ValueError:
         await message.answer("❌ Введите число (например: 0.3):")
 
@@ -504,6 +525,9 @@ async def receive_color(message: Message, state: FSMContext):
         
         await message.answer(f"✅ Цвет обновлен: RGB({r}, {g}, {b})")
         await state.clear()
+        
+        # Отправляем тестовое изображение
+        await send_test_preview(message, token)
     except ValueError:
         await message.answer("❌ Введите три числа от 0 до 255 через пробел:")
 
@@ -557,8 +581,149 @@ async def receive_opacity(message: Message, state: FSMContext):
         
         await message.answer(f"✅ Прозрачность обновлена: {opacity_percent}%")
         await state.clear()
+        
+        # Отправляем тестовое изображение
+        await send_test_preview(message, token)
     except ValueError:
         await message.answer("❌ Введите число от 0 до 100:")
+
+
+@master_router.message(Command("set_auto_color"))
+async def set_auto_color_toggle(message: Message):
+    if message.from_user.id not in authenticated_users:
+        await message.answer("❌ Доступ запрещен.")
+        return
+    
+    if not active_slaves:
+        await message.answer("❌ Нет активных slave ботов.")
+        return
+    
+    # Получаем выбранный бот
+    token = selected_slave_tokens.get(message.from_user.id)
+    if not token and len(active_slaves) == 1:
+        token = list(active_slaves.keys())[0]
+        selected_slave_tokens[message.from_user.id] = token
+    
+    if not token:
+        await message.answer("❌ Сначала выберите бота командой /configure_slave")
+        return
+    
+    if token not in slave_watermark_settings:
+        slave_watermark_settings[token] = DEFAULT_WATERMARK_SETTINGS.copy()
+    
+    # Переключаем автоматический цвет
+    current_auto_color = slave_watermark_settings[token].get('auto_color', False)
+    new_auto_color = not current_auto_color
+    slave_watermark_settings[token]['auto_color'] = new_auto_color
+    save_slaves_to_db()
+    
+    status = "включен" if new_auto_color else "выключен"
+    description = "Белый для темных изображений, черный для светлых" if new_auto_color else "Используется цвет из настроек"
+    
+    await message.answer(
+        f"✅ Автоматический цвет {status}.\n\n"
+        f"{description}\n\n"
+        f"Используйте /configure_slave для просмотра всех настроек."
+    )
+    
+    # Отправляем тестовое изображение
+    await send_test_preview(message, token)
+
+
+@master_router.message(Command("set_stroke"))
+async def set_stroke_toggle(message: Message):
+    if message.from_user.id not in authenticated_users:
+        await message.answer("❌ Доступ запрещен.")
+        return
+    
+    if not active_slaves:
+        await message.answer("❌ Нет активных slave ботов.")
+        return
+    
+    # Получаем выбранный бот
+    token = selected_slave_tokens.get(message.from_user.id)
+    if not token and len(active_slaves) == 1:
+        token = list(active_slaves.keys())[0]
+        selected_slave_tokens[message.from_user.id] = token
+    
+    if not token:
+        await message.answer("❌ Сначала выберите бота командой /configure_slave")
+        return
+    
+    if token not in slave_watermark_settings:
+        slave_watermark_settings[token] = DEFAULT_WATERMARK_SETTINGS.copy()
+    
+    # Переключаем обводку
+    current_stroke = slave_watermark_settings[token].get('stroke_enabled', False)
+    new_stroke = not current_stroke
+    slave_watermark_settings[token]['stroke_enabled'] = new_stroke
+    save_slaves_to_db()
+    
+    status = "включена" if new_stroke else "выключена"
+    description = "Цвет обводки будет инвертированным цветом текста" if new_stroke else "Обводка отключена"
+    
+    await message.answer(
+        f"✅ Обводка {status}.\n\n"
+        f"{description}\n\n"
+        f"Используйте /configure_slave для просмотра всех настроек."
+    )
+    
+    # Отправляем тестовое изображение
+    await send_test_preview(message, token)
+
+
+@master_router.message(Command("set_stroke_width"))
+async def set_stroke_width_start(message: Message, state: FSMContext):
+    if message.from_user.id not in authenticated_users:
+        await message.answer("❌ Доступ запрещен.")
+        return
+    
+    if not active_slaves:
+        await message.answer("❌ Нет активных slave ботов.")
+        return
+    
+    # Получаем выбранный бот
+    token = selected_slave_tokens.get(message.from_user.id)
+    if not token and len(active_slaves) == 1:
+        token = list(active_slaves.keys())[0]
+        selected_slave_tokens[message.from_user.id] = token
+    
+    if not token:
+        await message.answer("❌ Сначала выберите бота командой /configure_slave")
+        return
+    
+    await message.answer("🖊️ Введите толщину обводки в пикселях (1-10, рекомендуется 2-4):")
+    await state.set_state(MasterStates.waiting_stroke_width)
+
+
+@master_router.message(MasterStates.waiting_stroke_width)
+async def receive_stroke_width(message: Message, state: FSMContext):
+    try:
+        stroke_width = int(message.text.strip())
+        if stroke_width < 1 or stroke_width > 10:
+            await message.answer("❌ Толщина обводки должна быть от 1 до 10. Попробуйте еще раз:")
+            return
+        
+        token = selected_slave_tokens.get(message.from_user.id)
+        
+        if not token or token not in active_slaves:
+            await message.answer("❌ Ошибка: бот не найден. Начните заново с /configure_slave")
+            await state.clear()
+            return
+        
+        if token not in slave_watermark_settings:
+            slave_watermark_settings[token] = DEFAULT_WATERMARK_SETTINGS.copy()
+        
+        slave_watermark_settings[token]['stroke_width'] = stroke_width
+        save_slaves_to_db()
+        
+        await message.answer(f"✅ Толщина обводки обновлена: {stroke_width}px")
+        await state.clear()
+        
+        # Отправляем тестовое изображение
+        await send_test_preview(message, token)
+    except ValueError:
+        await message.answer("❌ Введите число от 1 до 10:")
 
 
 @master_router.message(Command("test_watermark"))
@@ -631,6 +796,110 @@ async def process_test_image(message: Message, state: FSMContext):
 
 
 # ============= SLAVE BOT ЛОГИКА =============
+def calculate_average_brightness(img: Image.Image) -> float:
+    """Вычисляет среднюю яркость изображения (0-255)"""
+    # Конвертируем в RGB, если нужно
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+    
+    # Получаем пиксели
+    pixels = list(img.getdata())
+    
+    # Вычисляем среднюю яркость используя формулу восприятия яркости
+    # L = 0.299*R + 0.587*G + 0.114*B
+    total_brightness = 0
+    for r, g, b in pixels:
+        brightness = 0.299 * r + 0.587 * g + 0.114 * b
+        total_brightness += brightness
+    
+    average_brightness = total_brightness / len(pixels)
+    logger.info(f"Средняя яркость изображения: {average_brightness:.2f}")
+    return average_brightness
+
+
+def get_auto_color(img: Image.Image) -> tuple:
+    """Определяет цвет водяного знака на основе яркости изображения"""
+    brightness = calculate_average_brightness(img)
+    
+    # Порог яркости: если средняя яркость меньше 128, изображение темное - используем белый
+    # Если больше или равно 128, изображение светлое - используем черный
+    if brightness < 128:
+        color = (255, 255, 255)  # Белый для темных изображений
+        logger.info("Изображение темное, выбран белый цвет")
+    else:
+        color = (0, 0, 0)  # Черный для светлых изображений
+        logger.info("Изображение светлое, выбран черный цвет")
+    
+    return color
+
+
+def invert_color(color: tuple) -> tuple:
+    """Инвертирует цвет (белый -> черный, черный -> белый)"""
+    r, g, b = color
+    inverted = (255 - r, 255 - g, 255 - b)
+    logger.info(f"Инвертирован цвет: RGB{color} -> RGB{inverted}")
+    return inverted
+
+
+async def generate_test_image(watermark_text: str, settings: Dict) -> bytes:
+    """Генерирует тестовое изображение с белым и черным фоном пополам"""
+    # Создаем изображение 800x400 (белый и черный фон пополам)
+    width, height = 800, 400
+    img = Image.new('RGB', (width, height), (255, 255, 255))
+    
+    # Рисуем черную половину (правая часть)
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([width // 2, 0, width, height], fill=(0, 0, 0))
+    
+    # Конвертируем в RGBA для добавления водяного знака
+    img = img.convert('RGBA')
+    
+    # Создаем копию для обработки
+    img_copy = img.copy()
+    
+    # Обрабатываем изображение с водяным знаком (увеличиваем и добавляем водяной знак)
+    img_bytes = BytesIO()
+    img_copy.save(img_bytes, format='PNG')
+    img_bytes.seek(0)
+    
+    # Используем функцию обработки изображения
+    processed_image = await process_image_with_watermark(
+        img_bytes.getvalue(),
+        watermark_text,
+        settings
+    )
+    
+    return processed_image
+
+
+async def send_test_preview(message: Message, token: str):
+    """Отправляет тестовое изображение с текущими настройками"""
+    try:
+        watermark_text = slave_watermarks.get(token, "")
+        settings = slave_watermark_settings.get(token, DEFAULT_WATERMARK_SETTINGS.copy())
+        
+        if not watermark_text:
+            await message.answer("⚠️ Текст водяного знака не установлен. Установите текст перед просмотром.")
+            return
+        
+        # Генерируем тестовое изображение
+        test_image = await generate_test_image(watermark_text, settings)
+        
+        # Отправляем изображение
+        input_file = BufferedInputFile(
+            test_image,
+            filename="watermark_preview.jpg"
+        )
+        
+        await message.answer_photo(
+            photo=input_file,
+            caption="📸 Предпросмотр водяного знака на белом и черном фоне"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка генерации тестового изображения: {e}", exc_info=True)
+        await message.answer(f"❌ Ошибка генерации предпросмотра: {str(e)}")
+
+
 async def process_image_with_watermark(
     image_bytes: bytes, 
     watermark_text: str, 
@@ -647,6 +916,15 @@ async def process_image_with_watermark(
     try:
         img = Image.open(BytesIO(image_bytes))
         logger.info(f"Исходное изображение: {img.size}, режим: {img.mode}, формат: {img.format}")
+        
+        # Если включен автоматический цвет, вычисляем яркость до увеличения размера (для оптимизации)
+        auto_color = settings.get('auto_color', DEFAULT_WATERMARK_SETTINGS['auto_color'])
+        auto_color_value = None
+        if auto_color:
+            # Сохраняем копию для вычисления яркости
+            brightness_img = img.copy()
+            auto_color_value = get_auto_color(brightness_img)
+            logger.info(f"Автоматический цвет определен: RGB{auto_color_value}")
         
         # Увеличиваем разрешение в 2 раза используя NEAREST для pixel art
         # NEAREST сохраняет четкие пиксели без размытия
@@ -722,14 +1000,50 @@ async def process_image_with_watermark(
         logger.info(f"Позиция водяного знака: ({x}, {y}), отступы: ({margin_x}, {margin_y})")
         
         # Получаем цвет и прозрачность из настроек
-        color_r = settings.get('color_r', DEFAULT_WATERMARK_SETTINGS['color_r'])
-        color_g = settings.get('color_g', DEFAULT_WATERMARK_SETTINGS['color_g'])
-        color_b = settings.get('color_b', DEFAULT_WATERMARK_SETTINGS['color_b'])
         opacity = settings.get('opacity', DEFAULT_WATERMARK_SETTINGS['opacity'])
+        stroke_enabled = settings.get('stroke_enabled', DEFAULT_WATERMARK_SETTINGS['stroke_enabled'])
+        stroke_width = settings.get('stroke_width', DEFAULT_WATERMARK_SETTINGS['stroke_width'])
         
-        # Рисуем текст с настройками цвета и прозрачности
-        draw.text((x, y), watermark_text, fill=(color_r, color_g, color_b, opacity), font=font)
-        logger.info(f"Цвет: RGB({color_r}, {color_g}, {color_b}), прозрачность: {opacity}/255")
+        # Определяем цвет: автоматический или из настроек
+        if auto_color and auto_color_value:
+            # Используем предварительно вычисленный автоматический цвет
+            color_r, color_g, color_b = auto_color_value
+            logger.info(f"Автоматический цвет: RGB({color_r}, {color_g}, {color_b})")
+        else:
+            # Используем цвет из настроек
+            color_r = settings.get('color_r', DEFAULT_WATERMARK_SETTINGS['color_r'])
+            color_g = settings.get('color_g', DEFAULT_WATERMARK_SETTINGS['color_g'])
+            color_b = settings.get('color_b', DEFAULT_WATERMARK_SETTINGS['color_b'])
+            logger.info(f"Цвет из настроек: RGB({color_r}, {color_g}, {color_b})")
+        
+        # Определяем цвет обводки
+        stroke_fill = None
+        if stroke_enabled:
+            if auto_color and auto_color_value:
+                # При автоматическом цвете обводка - инвертированный цвет текста
+                stroke_r, stroke_g, stroke_b = invert_color((color_r, color_g, color_b))
+                stroke_fill = (stroke_r, stroke_g, stroke_b, opacity)
+                logger.info(f"Автоматическая обводка (инвертированный цвет): RGB({stroke_r}, {stroke_g}, {stroke_b})")
+            else:
+                # При ручном цвете обводка - инвертированный цвет текста
+                stroke_r, stroke_g, stroke_b = invert_color((color_r, color_g, color_b))
+                stroke_fill = (stroke_r, stroke_g, stroke_b, opacity)
+                logger.info(f"Обводка (инвертированный цвет): RGB({stroke_r}, {stroke_g}, {stroke_b})")
+        
+        # Рисуем текст с настройками цвета, прозрачности и обводки
+        if stroke_enabled and stroke_fill:
+            draw.text(
+                (x, y), 
+                watermark_text, 
+                fill=(color_r, color_g, color_b, opacity),
+                font=font,
+                stroke_width=stroke_width,
+                stroke_fill=stroke_fill
+            )
+            logger.info(f"Текст с обводкой: цвет RGB({color_r}, {color_g}, {color_b}), обводка RGB{stroke_fill[:3]}, толщина {stroke_width}px")
+        else:
+            draw.text((x, y), watermark_text, fill=(color_r, color_g, color_b, opacity), font=font)
+            logger.info(f"Текст без обводки: цвет RGB({color_r}, {color_g}, {color_b}), прозрачность {opacity}/255")
         
         # Накладываем водяной знак
         img = Image.alpha_composite(img, watermark_layer)
