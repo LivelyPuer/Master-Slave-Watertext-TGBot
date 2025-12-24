@@ -1121,6 +1121,7 @@ async def process_zip_archive(
                     
                 file_ext = file_path.suffix.lower()
                 
+
                 out_file_path = current_out_dir / file
                 
                 if file_ext in image_extensions:
@@ -1136,15 +1137,16 @@ async def process_zip_archive(
                             settings
                         )
                         
-                        # Сохраняем обработанное
-                        with open(out_file_path, "wb") as f:
+                        # Сохраняем обработанное с префиксом watermarked_
+                        out_processed_path = current_out_dir / f"watermarked_{file}"
+                        with open(out_processed_path, "wb") as f:
                             f.write(processed_data)
                             
                         processed_count += 1
                         
                     except Exception as e:
                         logger.error(f"Не удалось обработать изображение {file}: {e}")
-                        # Если ошибка, копируем оригинал
+                        # Если ошибка, копируем оригинал с исходным именем
                         shutil.copy2(file_path, out_file_path)
                 else:
                     # Копируем остальные файлы без изменений
