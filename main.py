@@ -4,7 +4,11 @@ import json
 import logging
 from io import BytesIO
 from typing import Dict, Optional, List
+
 from pathlib import Path
+import zipfile
+import shutil
+import tempfile
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -1066,6 +1070,104 @@ async def process_image_with_watermark(
         raise
 
 
+
+async def process_zip_archive(
+    zip_bytes: bytes, 
+    watermark_text: str, 
+    settings: Optional[Dict] = None
+) -> bytes:
+    """Обрабатывает ZIP архив: извлекает, обрабатывает изображения и упаковывает обратно"""
+    if settings is None:
+        settings = DEFAULT_WATERMARK_SETTINGS.copy()
+    
+    logger.info(f"Начало обработки ZIP архива. Размер: {len(zip_bytes)} байт")
+    
+    # Создаем временные директории для распаковки и упаковки
+    with tempfile.TemporaryDirectory() as temp_in, tempfile.TemporaryDirectory() as temp_out:
+        # Сохраняем входящий zip
+        zip_path = Path(temp_in) / "input.zip"
+        with open(zip_path, "wb") as f:
+            f.write(zip_bytes)
+            
+        # Распаковываем
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_in)
+        except zipfile.BadZipFile:
+            logger.error("Некорректный ZIP файл")
+            raise ValueError("Файл поврежден или не является ZIP архивом")
+            
+        # Удаляем исходный zip, чтобы не обрабатывать его
+        os.remove(zip_path)
+        
+        # Итерируемся по файлам
+        input_path = Path(temp_in)
+        output_path = Path(temp_out)
+        
+        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'}
+        processed_count = 0
+        
+        for root, dirs, files in os.walk(input_path):
+            # Создаем структуру папок в выходной директории
+            rel_path = Path(root).relative_to(input_path)
+            current_out_dir = output_path / rel_path
+            current_out_dir.mkdir(parents=True, exist_ok=True)
+            
+            for file in files:
+                file_path = Path(root) / file
+                # Игнорируем скрытые файлы (например __MACOSX)
+                if file.startswith('.'):
+                    continue
+                    
+                file_ext = file_path.suffix.lower()
+                
+                out_file_path = current_out_dir / file
+                
+                if file_ext in image_extensions:
+                    try:
+                        # Читаем изображение
+                        with open(file_path, "rb") as f:
+                            img_data = f.read()
+                        
+                        # Обрабатываем
+                        processed_data = await process_image_with_watermark(
+                            img_data, 
+                            watermark_text, 
+                            settings
+                        )
+                        
+                        # Сохраняем обработанное
+                        with open(out_file_path, "wb") as f:
+                            f.write(processed_data)
+                            
+                        processed_count += 1
+                        
+                    except Exception as e:
+                        logger.error(f"Не удалось обработать изображение {file}: {e}")
+                        # Если ошибка, копируем оригинал
+                        shutil.copy2(file_path, out_file_path)
+                else:
+                    # Копируем остальные файлы без изменений
+                    shutil.copy2(file_path, out_file_path)
+        
+        logger.info(f"Обработано изображений в архиве: {processed_count}")
+        
+        # Создаем новый архив
+        archive_base = str(Path(tempfile.gettempdir()) / f"processed_{os.urandom(8).hex()}")
+        shutil.make_archive(archive_base, 'zip', temp_out)
+        
+        archive_path = archive_base + ".zip"
+        
+        # Читаем результат
+        with open(archive_path, "rb") as f:
+            result_bytes = f.read()
+            
+        # Удаляем временный архив
+        os.remove(archive_path)
+        
+        return result_bytes
+
+
 def create_slave_router(watermark_text: str, token: Optional[str] = None) -> Router:
     """Создает router для slave бота с заданным водяным знаком"""
     router = Router()
@@ -1073,12 +1175,14 @@ def create_slave_router(watermark_text: str, token: Optional[str] = None) -> Rou
     @router.message(CommandStart())
     async def slave_start(message: Message):
         await message.answer(
+
             f"👋 Привет! Я slave бот для добавления водяных знаков.\n\n"
             f"💧 Мой водяной знак: {watermark_text}\n\n"
-            f"📤 Отправь мне изображение(я) как файл, и я:\n"
-            f"1️⃣ Увеличу разрешение в 2 раза\n"
-            f"2️⃣ Добавлю водяной знак\n"
-            f"3️⃣ Отправлю обработанное изображение обратно"
+            f"📤 Отправь мне изображение как файл или ZIP архив, и я:\n"
+            f"1️⃣ Распакую архив (если отправлен архив)\n"
+            f"2️⃣ Увеличу разрешение всех картинок в 2 раза\n"
+            f"3️⃣ Добавлю водяной знак\n"
+            f"4️⃣ Отправлю готовый файл или архив обратно с сохранением структуры папок"
         )
     
     @router.message(F.document)
@@ -1087,13 +1191,18 @@ def create_slave_router(watermark_text: str, token: Optional[str] = None) -> Rou
         logger.info(f"Slave bot: получен документ от {message.from_user.id}")
         logger.info(f"Тип файла: {doc.mime_type}, размер: {doc.file_size}, имя: {doc.file_name}")
         
-        # Проверяем, что это изображение
-        if not doc.mime_type or not doc.mime_type.startswith('image/'):
-            logger.warning(f"Получен не-изображение: {doc.mime_type}")
-            await message.answer("❌ Пожалуйста, отправьте файл изображения (JPEG, PNG и т.д.)")
+
+        # Определяем тип файла
+        is_image = doc.mime_type and doc.mime_type.startswith('image/')
+        is_zip = doc.mime_type in ('application/zip', 'application/x-zip-compressed') or (doc.file_name and doc.file_name.lower().endswith('.zip'))
+
+        if not is_image and not is_zip:
+            logger.warning(f"Получен неподдерживаемый файл: {doc.mime_type}")
+            await message.answer("❌ Пожалуйста, отправьте файл изображения или ZIP архив с изображениями")
             return
         
-        processing_message = await message.answer("⏳ Обрабатываю изображение...")
+        status_text = "⏳ Обрабатываю архив..." if is_zip else "⏳ Обрабатываю изображение..."
+        processing_message = await message.answer(status_text)
         
         try:
             # Получаем файл
@@ -1101,45 +1210,50 @@ def create_slave_router(watermark_text: str, token: Optional[str] = None) -> Rou
             file = await message.bot.get_file(doc.file_id)
             logger.info(f"Путь к файлу: {file.file_path}")
             
-            file_bytes = await message.bot.download_file(file.file_path)
-            logger.info(f"Файл скачан, размер: {len(file_bytes.getvalue())} байт")
+            file_bytes_io = await message.bot.download_file(file.file_path)
+            file_data = file_bytes_io.read()
+            logger.info(f"Файл скачан, размер: {len(file_data)} байт")
             
-            # Обрабатываем изображение
-            logger.info("Начало обработки изображения...")
             # Получаем настройки для этого slave бота
             settings = slave_watermark_settings.get(token, DEFAULT_WATERMARK_SETTINGS.copy()) if token else DEFAULT_WATERMARK_SETTINGS.copy()
-            processed_image = await process_image_with_watermark(
-                file_bytes.read(), 
-                watermark_text,
-                settings
-            )            
-            # Отправляем обработанное изображение используя BufferedInputFile
-            logger.info("Отправка обработанного изображения...")
+            
+            if is_zip:
+                logger.info("Начало обработки ZIP архива...")
+                processed_data = await process_zip_archive(file_data, watermark_text, settings)
+                output_filename = f"watermarked_{doc.file_name}"
+            else:
+                logger.info("Начало обработки изображения...")
+                processed_data = await process_image_with_watermark(file_data, watermark_text, settings)            
+                output_filename = f"watermarked_{doc.file_name}"
+            
+            # Отправляем обработанный файл
+            logger.info("Отправка обработанного файла...")
             input_file = BufferedInputFile(
-                processed_image,
-                filename=f"watermarked_{doc.file_name}"
+                processed_data,
+                filename=output_filename
             )
             
-            # Удаляем сообщение "Обрабатываю изображение..."
+            # Удаляем сообщение о статусе
             if processing_message:
                 await message.bot.delete_message(chat_id=message.chat.id, message_id=processing_message.message_id)
-                logger.info("Сообщение 'Обрабатываю изображение...' удалено")
+                logger.info("Сообщение о статусе удалено")
 
-            await message.answer_document(
-                document=input_file)
-            logger.info("Изображение отправлено пользователю")
+            await message.answer_document(document=input_file)
+            logger.info("Файл отправлен пользователю")
             
         except Exception as e:
             logger.error(f"Ошибка обработки: {e}", exc_info=True)
-            await message.answer(f"❌ Ошибка обработки: {str(e)}")
+            text_error = "архива" if is_zip else "изображения"
+            await message.answer(f"❌ Ошибка обработки {text_error}: {str(e)}")
     
     @router.message(F.photo)
     async def handle_photo(message: Message):
         logger.info(f"Slave bot: получено фото (сжатое) от {message.from_user.id}")
         await message.answer(
-            "⚠️ Пожалуйста, отправьте изображение как ФАЙЛ (не как фото),\n"
-            "чтобы сохранить исходное качество.\n\n"
-            "📎 Нажмите на скрепку → Файл → выберите изображение"
+
+            "⚠️ Пожалуйста, отправьте изображение как ФАЙЛ (не как фото) или ZIP архив,\n"
+            "чтобы сохранить исходное качество и структуру.\n\n"
+            "📎 Нажмите на скрепку → Файл → выберите изображение или архив"
         )
     
     return router
