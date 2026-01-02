@@ -892,7 +892,7 @@ async def send_test_preview(message: Message, token: str):
         # Отправляем изображение
         input_file = BufferedInputFile(
             test_image,
-            filename="watermark_preview.jpg"
+            filename="watermark_preview.png"
         )
         
         await message.answer_photo(
@@ -919,7 +919,8 @@ async def process_image_with_watermark(
     
     try:
         img = Image.open(BytesIO(image_bytes))
-        logger.info(f"Исходное изображение: {img.size}, режим: {img.mode}, формат: {img.format}")
+        original_format = img.format
+        logger.info(f"Исходное изображение: {img.size}, режим: {img.mode}, формат: {original_format}")
         
         # Если включен автоматический цвет, вычисляем яркость до увеличения размера (для оптимизации)
         auto_color = settings.get('auto_color', DEFAULT_WATERMARK_SETTINGS['auto_color'])
@@ -1052,13 +1053,29 @@ async def process_image_with_watermark(
         # Накладываем водяной знак
         img = Image.alpha_composite(img, watermark_layer)
         
-        # Конвертируем обратно в RGB для сохранения в JPEG
-        img = img.convert('RGB')
-        logger.info("Конвертация в RGB для сохранения")
+        # Определяем формат сохранения
+        # Если исходный формат был JPEG, сохраняем как JPEG
+        # В остальных случаях (PNG, WEBP и др.) сохраняем как PNG для поддержки прозрачности
+        save_format = 'JPEG' if original_format == 'JPEG' else 'PNG'
+        
+        logger.info(f"Формат сохранения: {save_format} (исходный: {original_format})")
         
         # Сохраняем в BytesIO
         output = BytesIO()
-        img.save(output, format='JPEG', quality=95)
+        
+        if save_format == 'JPEG':
+            # Конвертируем в RGB для сохранения в JPEG (убираем альфа-канал, заменяя белым фоном)
+            if img.mode == 'RGBA':
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                background.paste(img, mask=img.split()[3])
+                img = background
+            else:
+                img = img.convert('RGB')
+                
+            img.save(output, format='JPEG', quality=95)
+        else:
+            # Для PNG сохраняем как есть (с прозрачностью)
+            img.save(output, format='PNG')
         output.seek(0)
         
         result_bytes = output.getvalue()
