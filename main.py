@@ -1092,8 +1092,8 @@ async def process_zip_archive(
     zip_bytes: bytes, 
     watermark_text: str, 
     settings: Optional[Dict] = None
-) -> bytes:
-    """Обрабатывает ZIP архив: извлекает, обрабатывает изображения и упаковывает обратно"""
+) -> List[bytes]:
+    """Обрабатывает ZIP архив: извлекает, обрабатывает и упаковывает в архивы по ~5-9 МБ"""
     if settings is None:
         settings = DEFAULT_WATERMARK_SETTINGS.copy()
     
@@ -1117,17 +1117,18 @@ async def process_zip_archive(
         # Удаляем исходный zip, чтобы не обрабатывать его
         os.remove(zip_path)
         
-        # Итерируемся по файлам
+        # Итерируемся по файлам и обрабатываем их
         input_path = Path(temp_in)
         output_path = Path(temp_out)
         
         image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'}
         processed_count = 0
+        processed_files_list = []  # Список кортежей (относительный путь, абсолютный путь к файлу)
         
         for root, dirs, files in os.walk(input_path):
             # Создаем структуру папок в выходной директории
-            rel_path = Path(root).relative_to(input_path)
-            current_out_dir = output_path / rel_path
+            rel_dir_path = Path(root).relative_to(input_path)
+            current_out_dir = output_path / rel_dir_path
             current_out_dir.mkdir(parents=True, exist_ok=True)
             
             for file in files:
@@ -1137,9 +1138,10 @@ async def process_zip_archive(
                     continue
                     
                 file_ext = file_path.suffix.lower()
-                
-
                 out_file_path = current_out_dir / file
+                
+                # Обработка файла
+                final_file_path = out_file_path
                 
                 if file_ext in image_extensions:
                     try:
@@ -1159,32 +1161,64 @@ async def process_zip_archive(
                         with open(out_processed_path, "wb") as f:
                             f.write(processed_data)
                             
+                        final_file_path = out_processed_path
                         processed_count += 1
                         
                     except Exception as e:
                         logger.error(f"Не удалось обработать изображение {file}: {e}")
-                        # Если ошибка, копируем оригинал с исходным именем
+                        # Если ошибка, копируем оригинал
                         shutil.copy2(file_path, out_file_path)
+                        final_file_path = out_file_path
                 else:
-                    # Копируем остальные файлы без изменений
+                    # Копируем остальные файлы
                     shutil.copy2(file_path, out_file_path)
+                    final_file_path = out_file_path
+                
+                # Добавляем в список для упаковки
+                # Сохраняем (относительный путь для архива, абсолютный путь на диске)
+                rel_path = final_file_path.relative_to(output_path)
+                processed_files_list.append((str(rel_path), final_file_path))
         
-        logger.info(f"Обработано изображений в архиве: {processed_count}")
+        logger.info(f"Обработано изображений в архиве: {processed_count}. Всего файлов для упаковки: {len(processed_files_list)}")
         
-        # Создаем новый архив
-        archive_base = str(Path(tempfile.gettempdir()) / f"processed_{os.urandom(8).hex()}")
-        shutil.make_archive(archive_base, 'zip', temp_out)
+        # Упаковка в архивы не более 5-9 МБ
+        archives_bytes = []
+        MAX_ARCHIVE_SIZE = 5 * 1024 * 1024  # 5 МБ целевой размер
         
-        archive_path = archive_base + ".zip"
+        current_zip_buffer = BytesIO()
+        current_zip_file = zipfile.ZipFile(current_zip_buffer, 'w', zipfile.ZIP_DEFLATED)
         
-        # Читаем результат
-        with open(archive_path, "rb") as f:
-            result_bytes = f.read()
+        for rel_path_str, abs_path in processed_files_list:
+            # Стратегия: если текущий размер буфера уже > 5 МБ, закрываем его и начинаем новый
+            # Проверяем реальный размер буфера zip файла
+            current_buffer_size = current_zip_buffer.tell()
             
-        # Удаляем временный архив
-        os.remove(archive_path)
+            if current_buffer_size > MAX_ARCHIVE_SIZE:
+                # Закрываем текущий архив
+                current_zip_file.close()
+                current_zip_buffer.seek(0)
+                archives_bytes.append(current_zip_buffer.getvalue())
+                
+                # Начинаем новый
+                logger.info(f"Архив заполнен ({current_buffer_size} байт), создаем новую часть")
+                current_zip_buffer = BytesIO()
+                current_zip_file = zipfile.ZipFile(current_zip_buffer, 'w', zipfile.ZIP_DEFLATED)
+            
+            # Добавляем файл
+            current_zip_file.write(abs_path, rel_path_str)
+            
+        # Закрываем последний архив
+        current_zip_file.close()
+        current_zip_buffer.seek(0)
+        final_bytes = current_zip_buffer.getvalue()
         
-        return result_bytes
+        if len(final_bytes) > 0:
+            archives_bytes.append(final_bytes)
+        
+        logger.info(f"Итого создано архивов: {len(archives_bytes)}")
+        return archives_bytes
+
+
 
 
 def create_slave_router(watermark_text: str, token: Optional[str] = None) -> Router:
@@ -1238,27 +1272,54 @@ def create_slave_router(watermark_text: str, token: Optional[str] = None) -> Rou
             
             if is_zip:
                 logger.info("Начало обработки ZIP архива...")
-                processed_data = await process_zip_archive(file_data, watermark_text, settings)
-                output_filename = f"watermarked_{doc.file_name}"
+                # Получаем результат (может быть bytes или List[bytes])
+                result = await process_zip_archive(file_data, watermark_text, settings)
+                
+                processed_archives = result if isinstance(result, list) else [result]
+                
+                # Отправляем все части
+                total_parts = len(processed_archives)
+                logger.info(f"Будет отправлено {total_parts} частей архива")
+                
+                for i, archive_bytes in enumerate(processed_archives):
+                    part_num = i + 1
+                    part_suffix = f"_part{part_num}" if total_parts > 1 else ""
+                    # Формируем имя файла
+                    name_base = doc.file_name.rsplit('.', 1)[0] if doc.file_name else "archive"
+                    output_filename = f"watermarked_{name_base}{part_suffix}.zip"
+                    
+                    input_file = BufferedInputFile(
+                        archive_bytes,
+                        filename=output_filename
+                    )
+                    
+                    caption = f"📦 Часть {part_num}/{total_parts}" if total_parts > 1 else None
+                    
+                    await message.answer_document(document=input_file, caption=caption)
+                    
+                    # Небольшая пауза между отправками
+                    if total_parts > 1 and i < total_parts - 1:
+                        await asyncio.sleep(2)
+
             else:
                 logger.info("Начало обработки изображения...")
                 processed_data = await process_image_with_watermark(file_data, watermark_text, settings)            
                 output_filename = f"watermarked_{doc.file_name}"
             
-            # Отправляем обработанный файл
-            logger.info("Отправка обработанного файла...")
-            input_file = BufferedInputFile(
-                processed_data,
-                filename=output_filename
-            )
+                # Отправляем обработанный файл
+                logger.info("Отправка обработанного файла...")
+                input_file = BufferedInputFile(
+                    processed_data,
+                    filename=output_filename
+                )
+                
+                await message.answer_document(document=input_file)
+                logger.info("Файл отправлен пользователю")
             
             # Удаляем сообщение о статусе
             if processing_message:
                 await message.bot.delete_message(chat_id=message.chat.id, message_id=processing_message.message_id)
                 logger.info("Сообщение о статусе удалено")
-
-            await message.answer_document(document=input_file)
-            logger.info("Файл отправлен пользователю")
             
         except Exception as e:
             logger.error(f"Ошибка обработки: {e}", exc_info=True)
