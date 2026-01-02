@@ -845,7 +845,7 @@ def invert_color(color: tuple) -> tuple:
     return inverted
 
 
-async def generate_test_image(watermark_text: str, settings: Dict) -> bytes:
+def generate_test_image(watermark_text: str, settings: Dict) -> bytes:
     """Генерирует тестовое изображение с белым и черным фоном пополам"""
     # Создаем изображение 800x400 (белый и черный фон пополам)
     width, height = 800, 400
@@ -867,7 +867,7 @@ async def generate_test_image(watermark_text: str, settings: Dict) -> bytes:
     img_bytes.seek(0)
     
     # Используем функцию обработки изображения
-    processed_image = await process_image_with_watermark(
+    processed_image = process_image_with_watermark(
         img_bytes.getvalue(),
         watermark_text,
         settings
@@ -887,7 +887,7 @@ async def send_test_preview(message: Message, token: str):
             return
         
         # Генерируем тестовое изображение
-        test_image = await generate_test_image(watermark_text, settings)
+        test_image = await asyncio.get_running_loop().run_in_executor(None, lambda: generate_test_image(watermark_text, settings))
         
         # Отправляем изображение
         input_file = BufferedInputFile(
@@ -904,7 +904,7 @@ async def send_test_preview(message: Message, token: str):
         await message.answer(f"❌ Ошибка генерации предпросмотра: {str(e)}")
 
 
-async def process_image_with_watermark(
+def process_image_with_watermark(
     image_bytes: bytes, 
     watermark_text: str, 
     settings: Optional[Dict] = None
@@ -1088,7 +1088,7 @@ async def process_image_with_watermark(
 
 
 
-async def process_zip_archive(
+def process_zip_archive(
     zip_bytes: bytes, 
     watermark_text: str, 
     settings: Optional[Dict] = None
@@ -1150,7 +1150,7 @@ async def process_zip_archive(
                             img_data = f.read()
                         
                         # Обрабатываем
-                        processed_data = await process_image_with_watermark(
+                        processed_data = process_image_with_watermark(
                             img_data, 
                             watermark_text, 
                             settings
@@ -1270,10 +1270,16 @@ def create_slave_router(watermark_text: str, token: Optional[str] = None) -> Rou
             # Получаем настройки для этого slave бота
             settings = slave_watermark_settings.get(token, DEFAULT_WATERMARK_SETTINGS.copy()) if token else DEFAULT_WATERMARK_SETTINGS.copy()
             
+            loop = asyncio.get_running_loop()
+            
             if is_zip:
-                logger.info("Начало обработки ZIP архива...")
+                logger.info("Начало обработки ZIP архива (в потоке)...")
+                # Запускаем синхронную функцию в executor
                 # Получаем результат (может быть bytes или List[bytes])
-                result = await process_zip_archive(file_data, watermark_text, settings)
+                result = await loop.run_in_executor(
+                    None, 
+                    lambda: process_zip_archive(file_data, watermark_text, settings)
+                )
                 
                 processed_archives = result if isinstance(result, list) else [result]
                 
@@ -1295,15 +1301,24 @@ def create_slave_router(watermark_text: str, token: Optional[str] = None) -> Rou
                     
                     caption = f"📦 Часть {part_num}/{total_parts}" if total_parts > 1 else None
                     
-                    await message.answer_document(document=input_file, caption=caption)
+                    # Отправляем с увеличенным таймаутом
+                    await message.bot.send_document(
+                        chat_id=message.chat.id,
+                        document=input_file, 
+                        caption=caption,
+                        request_timeout=300
+                    )
                     
                     # Небольшая пауза между отправками
                     if total_parts > 1 and i < total_parts - 1:
                         await asyncio.sleep(2)
 
             else:
-                logger.info("Начало обработки изображения...")
-                processed_data = await process_image_with_watermark(file_data, watermark_text, settings)            
+                logger.info("Начало обработки изображения (в потоке)...")
+                processed_data = await loop.run_in_executor(
+                    None,
+                    lambda: process_image_with_watermark(file_data, watermark_text, settings)
+                )
                 output_filename = f"watermarked_{doc.file_name}"
             
                 # Отправляем обработанный файл
@@ -1313,7 +1328,12 @@ def create_slave_router(watermark_text: str, token: Optional[str] = None) -> Rou
                     filename=output_filename
                 )
                 
-                await message.answer_document(document=input_file)
+                # Отправляем с увеличенным таймаутом
+                await message.bot.send_document(
+                    chat_id=message.chat.id,
+                    document=input_file,
+                    request_timeout=300
+                )
                 logger.info("Файл отправлен пользователю")
             
             # Удаляем сообщение о статусе

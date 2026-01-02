@@ -1,3 +1,4 @@
 .env
 slaves_database.json
 .env
+__pycache__
