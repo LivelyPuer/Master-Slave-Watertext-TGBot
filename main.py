@@ -775,7 +775,7 @@ async def process_test_image(message: Message, state: FSMContext):
     try:
         # Получаем файл
         file = await message.bot.get_file(doc.file_id)
-        file_bytes = await message.bot.download_file(file.file_path)
+        file_bytes = await message.bot.download_file(file.file_path, timeout=300)
         
         # Обрабатываем изображение с настройками
         processed_image = await process_image_with_watermark(
@@ -1229,7 +1229,7 @@ def create_slave_router(watermark_text: str, token: Optional[str] = None) -> Rou
             file = await message.bot.get_file(doc.file_id)
             logger.info(f"Путь к файлу: {file.file_path}")
             
-            file_bytes_io = await message.bot.download_file(file.file_path)
+            file_bytes_io = await message.bot.download_file(file.file_path, timeout=300)
             file_data = file_bytes_io.read()
             logger.info(f"Файл скачан, размер: {len(file_data)} байт")
             
